@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+
+# Trained models: regenerable (scripts/train_recommenders.py), but committed so
+# a deployment built from GitHub (Vercel) ranks with them. Retrain, then commit
+# data/models/ again.
+
+# Environment & secrets
+.env
+admin.txt
+
+# Database
+*.db
+*.sqlite3
+
+# Node / Next.js
+node_modules/
+dashboard/.next/
+dashboard/out/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Vercel CLI (project link and local dev state)
+.vercel/

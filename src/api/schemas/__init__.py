@@ -1,0 +1,377 @@
+from datetime import datetime
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from src.diet.excluded_foods import MAX_EXCLUDED
+
+
+class BiomarkersIn(BaseModel):
+    fasting_glucose: float | None = Field(None, ge=10, le=1000, description="mg/dL")
+    systolic_bp: float | None = Field(None, ge=40, le=300, description="mmHg")
+    diastolic_bp: float | None = Field(None, ge=20, le=200, description="mmHg")
+    hemoglobin: float | None = Field(None, ge=1, le=25, description="g/dL")
+
+
+_ACTIVITY_PATTERN = "^(sedentary|light|moderate|active)$"
+_FITNESS_PATTERN = "^(beginner|intermediate|advanced)$"
+
+
+class ExcludedFoodPick(BaseModel):
+    """A food or dish as a form sends it: its id from GET /foods/catalogue,
+    with the name the form showed it under. The name tells an entry sent
+    back unchanged from a fresh pick of whatever carries that id today."""
+
+    id: str = Field(min_length=1, max_length=50)
+    name_en: str = Field("", max_length=200)
+
+
+class PatientProfile(BaseModel):
+    """What the engine reads off a patient, apart from their name."""
+
+    sex: str = Field(pattern="^(male|female)$")
+    birth_year: int = Field(ge=1900, le=2030)
+    height_cm: float = Field(gt=30, lt=260)
+    pregnant: bool = False
+    pregnancy_trimester: int | None = Field(None, ge=1, le=3)
+    conditions: list[str] = []
+    dietary_restrictions: list[str] = []
+    # the foods and dishes the patient does not eat: bare ids are accepted too
+    excluded_foods: list[str | ExcludedFoodPick] = Field(default=[], max_length=MAX_EXCLUDED)
+    fitness_level: str = Field("beginner", pattern=_FITNESS_PATTERN)
+    # None = not recorded: the energy target then assumes a level and says so
+    activity_level: str | None = Field(None, pattern=_ACTIVITY_PATTERN)
+
+    @model_validator(mode="after")
+    def _trimester_only_in_pregnancy(self):
+        if not self.pregnant:
+            self.pregnancy_trimester = None
+        return self
+
+
+class PatientCreate(PatientProfile):
+    name: str = Field(min_length=1, max_length=200)
+    notes: str = ""
+
+
+class PatientUpdate(BaseModel):
+    """A change to a patient's record: only the fields sent are changed."""
+
+    name: str | None = Field(None, min_length=1, max_length=200)
+    height_cm: float | None = Field(None, gt=30, lt=260)
+    pregnant: bool | None = None
+    pregnancy_trimester: int | None = Field(None, ge=1, le=3)
+    conditions: list[str] | None = None
+    dietary_restrictions: list[str] | None = None
+    # the whole list as it should be afterwards
+    excluded_foods: list[str | ExcludedFoodPick] | None = Field(None, max_length=MAX_EXCLUDED)
+    fitness_level: str | None = Field(None, pattern=_FITNESS_PATTERN)
+    activity_level: str | None = Field(None, pattern=_ACTIVITY_PATTERN)
+    notes: str | None = None
+
+
+class ExcludedFood(BaseModel):
+    """A food or dish a patient does not eat, as recorded on the patient:
+    sent in by id, kept and returned with the name it had when chosen."""
+
+    id: str
+    kind: str  # "food" | "recipe"
+    name_en: str
+    name_bn: str = ""
+
+
+class PatientOut(PatientCreate):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    # the doctor whose patient this is; None = not yet with a doctor
+    doctor_id: int | None = None
+    created_at: datetime
+    excluded_foods: list[ExcludedFood] = []
+
+
+class UnassignedPatientOut(BaseModel):
+    """A patient with no doctor yet, as a doctor sees them before taking them
+    on: enough to recognise the person in front of them, nothing clinical."""
+
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    name: str
+    sex: str
+    birth_year: int
+    created_at: datetime
+
+
+class PatientAssign(BaseModel):
+    """An admin's choice of doctor for a patient; None leaves them unassigned."""
+
+    doctor_id: int | None
+
+
+class VisitCreate(BaseModel):
+    weight_kg: float = Field(gt=2, lt=400)
+    biomarkers: BiomarkersIn = BiomarkersIn()
+    ocr_raw: dict | None = None  # raw OCR output kept for audit, if OCR was used
+
+
+class VisitOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    patient_id: int
+    weight_kg: float
+    biomarkers: dict
+    created_at: datetime
+
+
+class AssessmentOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    visit_id: int
+    status: str
+    result: dict
+    engine_version: str
+    created_at: datetime
+
+
+class QueueItem(BaseModel):
+    assessment: AssessmentOut
+    patient: PatientOut
+    visit: VisitOut
+
+
+class MealItemEdit(BaseModel):
+    """One plan item: a single food (food_id) or a household dish
+    (recipe_id), with its quantity in grams either way."""
+
+    food_id: str | None = Field(None, min_length=1, max_length=50)
+    recipe_id: str | None = Field(None, min_length=1, max_length=50)
+    qty_g: float = Field(ge=5, le=2000)
+    # display name the physician saw — lets the server detect when the dataset
+    # was replaced and the id now denotes a different food entirely
+    name_en: str = Field("", max_length=200)
+
+    @model_validator(mode="after")
+    def _one_kind(self):
+        if (self.food_id is None) == (self.recipe_id is None):
+            raise ValueError("give exactly one of food_id or recipe_id")
+        return self
+
+
+class ExercisePlanEdit(BaseModel):
+    aerobic_days: int = Field(ge=1, le=7)
+    strength_days: int = Field(ge=0, le=7)
+    flexibility_days: int = Field(ge=0, le=7)
+    # planned for patients 65 and over (engine 0.12.0); absent keeps the plan's
+    balance_days: int | None = Field(None, ge=0, le=7)
+    aerobic_min_per_session: int = Field(ge=5, le=180)
+    # category -> exercise_ids the physician kept (validated against the
+    # contraindication-filtered exercise list server-side)
+    type: dict[str, list[str]] = {}
+
+
+class PlanEditIn(BaseModel):
+    """Physician edits to the diet/exercise plan, recomputed deterministically.
+
+    A week plan (engine 0.4.0 onwards) is sent as `days`, one meals mapping per
+    day in plan order; a one-day plan from an older assessment as `meals`."""
+
+    days: list[dict[str, list[MealItemEdit]]] | None = Field(None, max_length=7)
+    meals: dict[str, list[MealItemEdit]] | None = None
+    exercise: ExercisePlanEdit | None = None
+
+
+class WordingIn(BaseModel):
+    """The plan as the physician has it on screen - what an approval would
+    carry - to word the patient's report from."""
+
+    comment: str = ""
+    edited_result: dict | None = None
+    # False asks for the standard wording even where an LLM is configured
+    use_llm: bool = True
+
+
+class ReportWording(BaseModel):
+    text: str
+    source: str  # "llm" | "template"
+    # why the standard wording stands where the LLM's was asked for:
+    # "refused" | "incomplete" | "unavailable"
+    fallback: str | None = None
+
+
+class WordingOut(BaseModel):
+    """The report as the patient would read it, for the physician to read
+    first. An approval names this wording by its fingerprint."""
+
+    fingerprint: str
+    texts: dict[str, ReportWording]  # by language: "en", "bn"
+    ai_available: bool
+
+
+class ReviewDecision(BaseModel):
+    decision: str = Field(pattern="^(approved|rejected)$")
+    comment: str = ""
+    edited_result: dict | None = None  # if the physician edited the engine output
+    # an approval: the fingerprint of the report wording the physician was
+    # shown (POST /review/{id}/wording), which is the wording it releases
+    wording: str | None = Field(None, max_length=64)
+
+
+class ApprovalOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    assessment_id: int
+    physician_name: str
+    decision: str
+    comment: str
+    created_at: datetime
+
+
+class DoctorNoteCreate(BaseModel):
+    note: str = Field(min_length=1, max_length=4000)
+
+
+class DoctorNoteUpdate(BaseModel):
+    note: str = Field(min_length=1, max_length=4000)
+
+
+class DoctorNoteOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    visit_id: int
+    physician_name: str
+    note: str
+    created_at: datetime
+    updated_at: datetime | None
+
+
+class ReportOut(BaseModel):
+    visit_id: int
+    patient_name: str
+    lang: str
+    source: str  # "llm" | "template"
+    text: str
+    approved_by: str
+    approved_at: datetime
+    # the engine that built this plan, and the one running now: a plan from
+    # an older engine stays as approved, and the physician is told it is older
+    engine_version: str = ""
+    current_engine_version: str = ""
+    # structured payload so the dashboard can render a full report document;
+    # `result` is the approved (possibly physician-edited) assessment
+    comment: str = ""
+    visit_date: datetime | None = None
+    result: dict = {}
+    notes: list[DoctorNoteOut] = []
+
+
+class OcrResult(BaseModel):
+    biomarkers: BiomarkersIn
+    notes: str = ""
+    # which reader produced it ("RapidOCR" on this server, or "Claude"), and
+    # the text lines the local reader saw - kept with the visit for audit
+    engine: str = ""
+    text: list[str] = []
+
+
+# --- auth / accounts ---------------------------------------------------------
+
+_EMAIL_PATTERN = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
+
+
+class PatientProfileIn(PatientProfile):
+    """Health profile a patient supplies when registering their own account."""
+
+
+class RegisterIn(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    email: str = Field(pattern=_EMAIL_PATTERN, max_length=255)
+    password: str = Field(min_length=8, max_length=128)
+    role: str = Field(pattern="^(doctor|patient)$")  # admins are provisioned, never self-registered
+    # doctor-only
+    specialty: str = Field("", max_length=200)
+    license_no: str = Field("", max_length=100)
+    # patient-only
+    profile: PatientProfileIn | None = None
+
+
+class UserOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    email: str
+    name: str
+    role: str
+    status: str
+    specialty: str
+    license_no: str
+    patient_id: int | None
+    created_at: datetime
+
+
+class LoginIn(BaseModel):
+    email: str = Field(max_length=255)
+    password: str = Field(max_length=128)
+    # when set, the login is rejected if the account has a different role —
+    # each dashboard has its own sign-in page
+    role: str | None = Field(None, pattern="^(admin|doctor|patient)$")
+
+
+class LoginOut(BaseModel):
+    token: str
+    user: UserOut
+
+
+class PatientAccountCreate(BaseModel):
+    """Login credentials a doctor sets up for an existing patient."""
+
+    email: str = Field(pattern=_EMAIL_PATTERN, max_length=255)
+    password: str = Field(min_length=8, max_length=128)
+
+
+class PatientAccountOut(BaseModel):
+    """Whether a patient row has a linked login, and which email."""
+
+    email: str | None
+
+
+class DoctorDecision(BaseModel):
+    decision: str = Field(pattern="^(approved|rejected)$")
+
+
+class AdminPatientOut(BaseModel):
+    """Patient row for the admin panel, with the linked login (if any)."""
+
+    patient: PatientOut
+    account_email: str | None
+
+
+class AdminStats(BaseModel):
+    patients: int
+    doctors_active: int
+    doctors_pending: int
+    visits: int
+    assessments_pending: int
+    assessments_approved: int
+    assessments_rejected: int
+
+
+class AuditOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    actor: str
+    action: str
+    entity: str
+    entity_id: int | None
+    detail: dict
+    created_at: datetime
+
+
+class VisitStatusItem(BaseModel):
+    """One row of the patient dashboard: a visit plus where it is in review."""
+
+    visit: VisitOut
+    status: str  # pending | approved | rejected
+    assessment_id: int | None
+    report_ready: bool
+
+
+class PatientDashboardOut(BaseModel):
+    patient: PatientOut
+    items: list[VisitStatusItem]

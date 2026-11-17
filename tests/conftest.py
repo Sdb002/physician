@@ -1,0 +1,114 @@
+import os
+import tempfile
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+
+# The app migrates its configured database and creates the default admin at
+# startup. Point it at a throwaway file before anything reads the settings,
+# so running the tests never touches the developer's health.db.
+_APP_DB_DIR = tempfile.TemporaryDirectory(prefix="health-tests-", ignore_cleanup_errors=True)
+os.environ["DATABASE_URL"] = f"sqlite:///{(Path(_APP_DB_DIR.name) / 'app.db').as_posix()}"
+
+from src.api.deps import get_db  # noqa: E402
+from src.api.main import app  # noqa: E402
+from src.core.security import create_token, hash_password  # noqa: E402
+from src.db.models import Base, User  # noqa: E402
+from src.diet import recommender  # noqa: E402
+from src.lifestyle import recommender as exercise_recommender  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _no_trained_model(monkeypatch):
+    """Pin the whole suite to the deterministic scoring fallback by default
+    (foods, recipes and exercises).
+
+    Without this, tests/test_deficiency_match.py, tests/test_meal_plan.py and
+    tests/test_recipe_ranking.py (which assert exact deterministic-formula
+    properties) would pass only by accident of whether the trained models in
+    data/models/ happen to exist on whoever's machine is running pytest —
+    true once the training script has ever been run locally.
+    tests/test_recommender.py overrides this per-test via monkeypatch (last
+    set wins).
+    """
+    monkeypatch.setattr(recommender, "load_model", lambda: None)
+    monkeypatch.setattr(recommender, "load_recipe_model", lambda: None)
+    monkeypatch.setattr(exercise_recommender, "load_model", lambda: None)
+
+
+@pytest.fixture()
+def db_session():
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    TestSession = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    session = TestSession()
+    try:
+        yield session
+    finally:
+        session.close()
+
+
+@pytest.fixture()
+def client():
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    TestSession = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+
+    def override_get_db():
+        db = TestSession()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    # workflow routes are staff-only: authenticate the client as a doctor,
+    # and expose admin/patient credentials for tests that need other roles
+    setup = TestSession()
+    doctor = User(email="doctor@test.local", password_hash=hash_password("password123"),
+                  name="Dr Test", role="doctor", status="active")
+    admin = User(email="admin@test.local", password_hash=hash_password("password123"),
+                 name="Admin Test", role="admin", status="active")
+    setup.add_all([doctor, admin])
+    setup.commit()
+    doctor_id, admin_id = doctor.id, admin.id
+    setup.close()
+
+    app.dependency_overrides[get_db] = override_get_db
+    with TestClient(app) as test_client:
+        test_client.headers.update(
+            {"Authorization": f"Bearer {create_token(doctor_id, 'doctor')}"}
+        )
+        test_client.admin_headers = {
+            "Authorization": f"Bearer {create_token(admin_id, 'admin')}"
+        }
+
+        def approve(assessment_id, headers=None, use_llm=False, **decision):
+            """Approve as the review screen does: have the report worded for
+            the plan and comment being approved, then approve the wording
+            that came back. Returns the decision's response. The standard
+            wording unless a test asks otherwise, so a developer's own
+            ANTHROPIC_API_KEY is never spent by the suite."""
+            plan = {key: decision[key] for key in ("comment", "edited_result") if key in decision}
+            wording = test_client.post(f"/review/{assessment_id}/wording", headers=headers,
+                                       json={**plan, "use_llm": use_llm})
+            assert wording.status_code == 200, wording.text
+            return test_client.post(
+                f"/review/{assessment_id}/decision", headers=headers,
+                json={"decision": "approved", **decision,
+                      "wording": wording.json()["fingerprint"]})
+
+        test_client.approve = approve
+        yield test_client
+    app.dependency_overrides.clear()

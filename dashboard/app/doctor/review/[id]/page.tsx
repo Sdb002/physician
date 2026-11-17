@@ -1,0 +1,1206 @@
+"use client";
+
+import Link from "next/link";
+import { useParams, useRouter } from "next/navigation";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { AllowedFood, api, AssessmentResult, MealItem, QueueItem, ReportWording } from "@/lib/api";
+import { useAuth } from "@/lib/auth";
+import {
+  avoidReasonName,
+  conditionName,
+  engineAtLeast,
+  exerciseTagName,
+  bmiCategoryName,
+  foodDisplayName,
+  formatDate,
+  localName,
+  mealItemKey,
+  mealName,
+  planDays,
+  planGroups,
+  portionText,
+  weekdayName,
+  type ExerciseGroup,
+} from "@/lib/clinical-terms";
+import { ExerciseItemView } from "@/components/exercise-item";
+import { DayPicker, WeekPlan } from "@/components/week-plan";
+import { PlanNutrition } from "@/components/plan-nutrition";
+import { dietaryRestrictionLabel } from "@/lib/patient-options";
+import { pid } from "@/lib/format";
+import { riskLabel } from "@/lib/triage";
+import { useT } from "@/lib/use-t";
+import type { Lang } from "@/lib/use-lang";
+import { FoodCombobox } from "@/components/FoodCombobox";
+import { FindingsList } from "@/components/findings";
+import { IconAlert, IconCheck, IconFileText, IconRx, IconSparkles, IconX } from "@/components/icons";
+import { RecommendedFoodsList, RecommendedRecipesList } from "@/components/recommendations";
+import { ReportProse } from "@/components/report-prose";
+import { ConditionFoodsGuide } from "@/components/condition-foods";
+import {
+  Badge,
+  Card,
+  ErrorNote,
+  Field,
+  InfoNote,
+  PageHeader,
+  PatientBanner,
+  Skeleton,
+  buttonDanger,
+  buttonPrimary,
+  buttonSecondary,
+  inputClass,
+  linkButton,
+} from "@/components/ui";
+
+const MEAL_ORDER = ["breakfast", "lunch", "dinner", "snack"];
+const GROUP_NAMES: Record<ExerciseGroup, string> = {
+  aerobic: "Aerobic",
+  strength: "Strength",
+  flexibility: "Flexibility",
+  balance: "Balance",
+};
+const STATUS_NAMES: Record<string, string> = { pending: "Pending", approved: "Approved", rejected: "Rejected" };
+const INTENSITY_NAMES: Record<string, string> = { light: "Light", moderate: "Moderate", vigorous: "Vigorous" };
+const FITNESS_LEVELS: Record<string, string> = {
+  beginner: "Beginner",
+  intermediate: "Intermediate",
+  advanced: "Advanced",
+};
+/* The engine writes its notes to the physician in English only. */
+const ENGINE_TEXT_NOTE = "The engine writes these notes in English.";
+/* Why the standard wording stands where the AI's was asked for. */
+const WORDING_FALLBACKS: Record<string, string> = {
+  refused: "The AI declined to word this report, so this is the standard wording.",
+  incomplete: "The AI's wording was cut off before its end, so this is the standard wording.",
+  unavailable: "The AI service could not be reached, so this is the standard wording.",
+};
+
+interface DraftMealItem {
+  /** exactly one of these: a household dish or a single food */
+  recipe_id?: string;
+  food_id?: string;
+  name_en: string;
+  name_bn: string;
+  qty_g: number;
+  /** energy density from the recipe/food data (0 when unknown → kcal shown after apply) */
+  kcal_per_100g: number;
+  /** a dish's serving weight, so the editor can say how many servings qty_g is */
+  serving_size_g?: number;
+}
+
+interface DraftDay {
+  /** absent for a one-day plan from before weekly plans */
+  weekday?: string;
+  meals: Record<string, DraftMealItem[]>;
+}
+
+const draftServings = (it: DraftMealItem) =>
+  it.recipe_id && it.serving_size_g ? it.qty_g / it.serving_size_g : undefined;
+
+const itemKcal = (it: DraftMealItem) => Math.round((it.qty_g * it.kcal_per_100g) / 100);
+
+interface DraftExercise {
+  aerobic_days: number;
+  strength_days: number;
+  flexibility_days: number;
+  /** only in plans for patients 65 and over */
+  balance_days?: number;
+  aerobic_min_per_session: number;
+  type: Partial<Record<ExerciseGroup, { exercise_id: string; name_en: string; name_bn: string }[]>>;
+}
+
+const removeButton =
+  "shrink-0 cursor-pointer rounded-md p-1.5 text-ink-muted hover:bg-crit-tint hover:text-crit-ink " +
+  "focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-crit-mark";
+
+/** Scroll a panel to the top of the view, and move focus to it when asked. */
+function bringIntoView(panel: HTMLElement | null, focus: boolean) {
+  if (!panel) return;
+  if (focus) panel.focus({ preventScroll: true });
+  panel.scrollIntoView({
+    block: "start",
+    behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth",
+  });
+}
+
+export default function ReviewDetailPage() {
+  const { id } = useParams<{ id: string }>();
+  const router = useRouter();
+  const { session } = useAuth();
+  const { t, n, rich, lang } = useT();
+  const [item, setItem] = useState<QueueItem | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [comment, setComment] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+
+  // physician plan edits: draft state while editing, recomputed result after apply
+  const [edited, setEdited] = useState<AssessmentResult | null>(null);
+  const [editing, setEditing] = useState(false);
+  const [applying, setApplying] = useState(false);
+  const [editError, setEditError] = useState<string | null>(null);
+  // the plan being edited, one entry per day (a single entry for a one-day
+  // plan from before weekly plans), and the day on screen
+  const [draftDays, setDraftDays] = useState<DraftDay[]>([]);
+  const [editDay, setEditDay] = useState(0);
+  const draftIsWeek = draftDays.some((day) => day.weekday);
+  const [draftEx, setDraftEx] = useState<DraftExercise | null>(null);
+  // live, contraindication-filtered food list (never the stale copy stored in
+  // the assessment — the dataset may have changed since it was generated)
+  const [foods, setFoods] = useState<AllowedFood[] | null>(null);
+
+  // The patient's report, worded for the plan and comment it was asked for.
+  // The physician reads it here before approving: an approval names this
+  // wording, and the patient is shown exactly this text.
+  const [wording, setWording] = useState<{
+    report: ReportWording;
+    comment: string;
+    edited: AssessmentResult | null;
+  } | null>(null);
+  const [wordingBusy, setWordingBusy] = useState(false);
+  const [aiAvailable, setAiAvailable] = useState(false);
+  const [useAi, setUseAi] = useState(true);
+  // the language of the report on screen; the interface's until one is picked
+  const [wordingLang, setWordingLang] = useState<Lang | null>(null);
+  const wordingPanel = useRef<HTMLDivElement>(null);
+
+  const foodIndex = useMemo(
+    () => new Map((foods ?? []).map((f) => [mealItemKey(f), f])),
+    [foods]
+  );
+  // this patient's ranked dishes and foods, restricted to the live
+  // gate-filtered list (a recommendation can go stale the same way a stored
+  // meal item can)
+  const recommendedFoods = useMemo(() => {
+    const nutrition = item?.assessment.result.nutrition;
+    const keys = [
+      ...(nutrition?.top_recipes ?? []).map((r) => r.recipe_id),
+      ...(nutrition?.top_foods ?? []).map((f) => f.food_id),
+    ];
+    return keys
+      .map((key) => foodIndex.get(key))
+      .filter((f): f is AllowedFood => f !== undefined);
+  }, [item, foodIndex]);
+
+  useEffect(() => {
+    api.getAssessment(id).then(setItem).catch((e) => setError(e.message));
+    // whether this server can word reports with AI; without it the report
+    // is in the standard wording and nothing about AI is offered
+    api
+      .health()
+      .then((h) => setAiAvailable(h.llm_configured))
+      .catch(() => {});
+  }, [id]);
+
+  // the report arrives a while after it was asked for: bring it into view,
+  // and put focus on it so a screen reader starts reading there
+  useEffect(() => {
+    if (wording) bringIntoView(wordingPanel.current, true);
+  }, [wording]);
+
+  const previewReport = async (withAi: boolean) => {
+    setWordingBusy(true);
+    setUseAi(withAi);
+    setError(null);
+    bringIntoView(wordingPanel.current, false);
+    try {
+      const report = await api.wordReport(id, {
+        comment,
+        edited_result: edited ?? null,
+        use_llm: withAi,
+      });
+      setAiAvailable(report.ai_available);
+      setWording({ report, comment, edited });
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setWordingBusy(false);
+    }
+  };
+
+  const decide = async (decision: "approved" | "rejected") => {
+    setSubmitting(true);
+    setError(null);
+    try {
+      await api.decide(id, {
+        decision,
+        comment,
+        edited_result: edited ?? null,
+        // an approval releases the wording that was read, and names it
+        ...(decision === "approved" ? { wording: wording?.report.fingerprint } : {}),
+      });
+      if (decision === "approved" && item) {
+        router.push(`/doctor/reports/${item.visit.id}`);
+      } else {
+        router.push("/doctor/review");
+      }
+    } catch (err) {
+      setError((err as Error).message);
+      setSubmitting(false);
+    }
+  };
+
+  const startEdit = async (result: AssessmentResult) => {
+    let liveFoods = foods;
+    if (liveFoods === null) {
+      try {
+        liveFoods = await api.reviewFoods(id);
+        setFoods(liveFoods);
+      } catch {
+        liveFoods = [];
+      }
+    }
+    const liveIndex = new Map(liveFoods.map((f) => [mealItemKey(f), f]));
+    const toDraft = (items: MealItem[]): DraftMealItem[] =>
+      items.map((i) => {
+        const live = liveIndex.get(mealItemKey(i));
+        return {
+          recipe_id: i.recipe_id, food_id: i.recipe_id ? undefined : i.food_id,
+          name_en: i.name_en, name_bn: i.name_bn, qty_g: i.qty_g,
+          kcal_per_100g:
+            i.qty_g > 0 && i.kcal > 0 ? (i.kcal / i.qty_g) * 100 : live?.kcal_per_100g ?? 0,
+          serving_size_g: i.serving_size_g ?? live?.serving_size_g,
+        };
+      });
+    setDraftDays(
+      planDays(result.nutrition.meal_plan).map((day) => ({
+        weekday: day.weekday,
+        meals: Object.fromEntries(Object.entries(day.meals).map(([meal, items]) => [meal, toDraft(items)])),
+      }))
+    );
+    setEditDay(0);
+    const plan = result.exercise_plan;
+    setDraftEx(
+      plan.time
+        ? {
+            aerobic_days: plan.frequency!.aerobic_days,
+            strength_days: plan.frequency!.strength_days,
+            flexibility_days: plan.frequency!.flexibility_days,
+            balance_days: plan.frequency!.balance_days,
+            aerobic_min_per_session: plan.time.aerobic_min_per_session,
+            type: Object.fromEntries(
+              planGroups(plan.frequency!).map((g) => [
+                g,
+                (plan.type?.[g] ?? []).map((e) => ({
+                  exercise_id: e.exercise_id, name_en: e.name_en, name_bn: e.name_bn,
+                })),
+              ])
+            ),
+          }
+        : null
+    );
+    setEditError(null);
+    setEditing(true);
+  };
+
+  const applyEdits = async () => {
+    setApplying(true);
+    setEditError(null);
+    try {
+      const payload = (meals: Record<string, DraftMealItem[]>) =>
+        Object.fromEntries(
+          Object.entries(meals).map(([meal, items]) => [
+            meal,
+            items.map((i) =>
+              i.recipe_id
+                ? { recipe_id: i.recipe_id, qty_g: i.qty_g, name_en: i.name_en }
+                : { food_id: i.food_id, qty_g: i.qty_g, name_en: i.name_en }
+            ),
+          ])
+        );
+      const result = await api.recomputePlan(id, {
+        ...(draftIsWeek
+          ? { days: draftDays.map((day) => payload(day.meals)) }
+          : { meals: payload(draftDays[0]?.meals ?? {}) }),
+        exercise: draftEx
+          ? {
+              aerobic_days: draftEx.aerobic_days,
+              strength_days: draftEx.strength_days,
+              flexibility_days: draftEx.flexibility_days,
+              ...(draftEx.balance_days != null ? { balance_days: draftEx.balance_days } : {}),
+              aerobic_min_per_session: draftEx.aerobic_min_per_session,
+              type: Object.fromEntries(
+                Object.entries(draftEx.type).map(([g, list]) => [
+                  g,
+                  (list ?? []).map((e) => e.exercise_id),
+                ])
+              ),
+            }
+          : undefined,
+      });
+      setEdited(result);
+      setEditing(false);
+    } catch (err) {
+      setEditError((err as Error).message);
+    } finally {
+      setApplying(false);
+    }
+  };
+
+  if (error && !item) return <ErrorNote message={error} />;
+  if (!item) {
+    return (
+      <div className="space-y-4">
+        <Skeleton className="h-24" />
+        <Skeleton className="h-96" />
+      </div>
+    );
+  }
+
+  const original = item.assessment.result;
+  const r = edited ?? original;
+  const decided = item.assessment.status !== "pending";
+  const planIsWeek = (r.nutrition.meal_plan.days?.length ?? 0) > 0;
+  const plan = r.exercise_plan;
+  const canEdit = !decided && !editing;
+  const wordings = Object.values(wording?.report.texts ?? {});
+  // A wording is for one plan: edit the plan and the report has to be
+  // previewed again before it can be approved. The standard wording also
+  // quotes the comment, so it is for one comment too; the AI is never given
+  // the comment (the report shows it beside the text), so its wording stands.
+  const quotesComment = wordings.some((text) => text.source === "template");
+  const wordingCurrent =
+    wording !== null && wording.edited === edited && (wording.comment === comment || !quotesComment);
+  const shownLang = wordingLang ?? lang;
+  const shownText = wording?.report.texts[shownLang];
+  const otherText = wording?.report.texts[shownLang === "en" ? "bn" : "en"];
+  const aiFellBack = wordings.some((text) => text.fallback);
+
+  const draftMeals = draftDays[editDay]?.meals ?? {};
+  // edits apply to the day on screen
+  const updateDay = (change: (meals: Record<string, DraftMealItem[]>) => Record<string, DraftMealItem[]>) =>
+    setDraftDays((days) => days.map((day, i) => (i === editDay ? { ...day, meals: change(day.meals) } : day)));
+
+  const setQty = (meal: string, index: number, qty: number) =>
+    updateDay((d) => ({
+      ...d,
+      [meal]: d[meal].map((it, i) => (i === index ? { ...it, qty_g: qty } : it)),
+    }));
+
+  const removeItem = (meal: string, index: number) =>
+    updateDay((d) => ({ ...d, [meal]: d[meal].filter((_, i) => i !== index) }));
+
+  const addItem = (meal: string, food: AllowedFood) => {
+    updateDay((d) => ({
+      ...d,
+      [meal]: [
+        ...(d[meal] ?? []),
+        {
+          recipe_id: food.recipe_id, food_id: food.recipe_id ? undefined : food.food_id,
+          name_en: food.name_en, name_bn: food.name_bn,
+          // a dish starts at one serving, a single food at 100 g
+          qty_g: food.kind === "recipe" && food.serving_size_g ? food.serving_size_g : 100,
+          kcal_per_100g: food.kcal_per_100g, serving_size_g: food.serving_size_g,
+        },
+      ],
+    }));
+  };
+
+  const dayKcal = (meals: Record<string, DraftMealItem[]>) =>
+    Object.values(meals).flat().reduce((sum, it) => sum + itemKcal(it), 0);
+  const draftTotalKcal = dayKcal(draftMeals);
+  const draftWeekAverage = draftDays.length
+    ? Math.round(draftDays.reduce((sum, day) => sum + dayKcal(day.meals), 0) / draftDays.length)
+    : 0;
+  const editDayName = draftDays[editDay]?.weekday ? weekdayName(draftDays[editDay].weekday!, lang) : null;
+  const targetKcal = r.nutrition.meal_plan.target_kcal || r.anthropometrics.target_kcal;
+  const draftPct = targetKcal ? Math.round((draftTotalKcal / targetKcal) * 100) : 0;
+
+  const removeExercise = (group: ExerciseGroup, index: number) =>
+    setDraftEx((d) =>
+      d ? { ...d, type: { ...d.type, [group]: (d.type[group] ?? []).filter((_, i) => i !== index) } } : d
+    );
+
+  const setExField = (key: keyof Omit<DraftExercise, "type">, value: number) =>
+    setDraftEx((d) => (d ? { ...d, [key]: value } : d));
+
+  const planTotal = Number(r.nutrition.meal_plan.totals?.kcal ?? 0);
+  const planTarget = r.nutrition.meal_plan.target_kcal;
+  const planPct = planTotal && planTarget ? Math.round((planTotal / planTarget) * 100) : null;
+
+  return (
+    <div className="space-y-6">
+      <PageHeader
+        title={t("Assessment {id}", { id: item.assessment.id })}
+        subtitle={t("Visit on {date}, engine v{version}", {
+          date: formatDate(item.visit.created_at, lang),
+          version: item.assessment.engine_version,
+        })}
+        back={{ href: "/doctor/review", label: t("Review queue") }}
+        action={
+          <div className="flex flex-wrap items-center gap-2">
+            {edited && <Badge kind="flag">{t("Plan edited")}</Badge>}
+            <Badge kind={item.assessment.status}>{t(STATUS_NAMES[item.assessment.status] ?? item.assessment.status)}</Badge>
+          </div>
+        }
+      />
+
+      <PatientBanner
+        name={item.patient.name}
+        id={pid(item.patient.id)}
+        sex={item.patient.sex}
+        age={r.age}
+        heightCm={item.patient.height_cm}
+        weightKg={item.visit.weight_kg}
+        pregnant={item.patient.pregnant}
+        conditions={item.patient.conditions}
+        action={<Badge kind={r.overall_risk}>{riskLabel(r.overall_risk, t)}</Badge>}
+      />
+
+      <div className="grid items-start gap-6 lg:grid-cols-[22rem_1fr]">
+        {/* the engine's reasoning: what it found and what it excluded */}
+        <div className="space-y-6 lg:sticky lg:top-6">
+          <Card title={t("Findings")}>
+            <dl className="mb-4 grid grid-cols-2 gap-3 border-b border-line pb-4">
+              <div>
+                <dt className="text-sm text-ink-muted">{t("BMI (Asian cutoffs)")}</dt>
+                <dd className="text-xl font-bold text-ink">
+                  {n(r.anthropometrics.bmi)}
+                  <span className="ml-1.5 text-sm font-normal text-ink-muted">
+                    {bmiCategoryName(r.anthropometrics.bmi_category, lang)}
+                  </span>
+                </dd>
+              </div>
+              <div>
+                <dt className="text-sm text-ink-muted">{t("Energy target")}</dt>
+                <dd className="text-xl font-bold text-ink">
+                  {n(r.anthropometrics.target_kcal)}
+                  <span className="ml-1 text-sm font-normal text-ink-muted">{t("kcal/day")}</span>
+                </dd>
+              </div>
+            </dl>
+            {r.risk_flags.length === 0 ? (
+              <p className="text-sm text-ink-muted">{t("No biomarkers recorded.")}</p>
+            ) : (
+              <FindingsList flags={r.risk_flags} lang={lang} />
+            )}
+          </Card>
+
+          {(r.cautions ?? []).length > 0 && (
+            <div role="note" className="rounded-xl border border-watch-line bg-watch-tint px-5 py-4">
+              <h2 className="flex items-center gap-2 font-semibold text-watch-ink">
+                <IconAlert className="h-4 w-4 shrink-0" />
+                {t("Check before approving")}
+              </h2>
+              <ul className="mt-2 space-y-2 text-sm text-watch-ink">
+                {r.cautions!.map((caution) => (
+                  <li key={caution}>{caution}</li>
+                ))}
+              </ul>
+              {lang === "bn" && <p className="mt-2 text-xs text-watch-ink">{t(ENGINE_TEXT_NOTE)}</p>}
+            </div>
+          )}
+
+          <Card title={t("Why this plan")}>
+            <h3 className="text-sm font-semibold text-ink-strong">{t("Derived conditions")}</h3>
+            <p className="mt-1 text-sm text-ink">
+              {r.conditions.length === 0 ? (
+                <span className="text-ink-muted">{t("None")}</span>
+              ) : (
+                r.conditions.map((c) => conditionName(c, lang)).join(", ")
+              )}
+            </p>
+            {(r.dietary_restrictions ?? []).length + (r.excluded_foods ?? []).length > 0 && (
+              <>
+                <h3 className="mt-4 text-sm font-semibold text-ink-strong">{t("Does not eat")}</h3>
+                <p className="mt-1 text-sm text-ink">
+                  {[
+                    ...(r.dietary_restrictions ?? []).map((key) => t(dietaryRestrictionLabel(key))),
+                    ...(r.excluded_foods ?? []).map((food) => localName(food, lang)),
+                  ].join(", ")}
+                </p>
+              </>
+            )}
+            <h3 className="mt-4 text-sm font-semibold text-ink-strong">{t("Safety exclusions applied")}</h3>
+            <p className="mt-1 text-sm text-ink-soft">
+              {rich("Removed before ranking: foods tagged {foodTags}; exercises tagged {exerciseTags}.", {
+                foodTags: (
+                  <strong className="font-semibold text-ink">
+                    {r.exclusions.food_tags.length
+                      ? r.exclusions.food_tags.map((tag) => (lang === "bn" ? avoidReasonName(tag, lang) : tag)).join(", ")
+                      : t("none")}
+                  </strong>
+                ),
+                exerciseTags: (
+                  <strong className="font-semibold text-ink">
+                    {r.exclusions.exercise_tags.length
+                      ? r.exclusions.exercise_tags.map((tag) => t(exerciseTagName(tag))).join(", ")
+                      : t("none")}
+                  </strong>
+                ),
+              })}
+              {(r.excluded_foods ?? []).length > 0 && (
+                <>
+                  {" "}
+                  {rich("Also removed: what the patient does not eat, with {dishes} that use it.", {
+                    dishes: (
+                      <strong className="font-semibold text-ink">
+                        {(r.exclusions.recipe_ids ?? []).length === 1
+                          ? t("1 dish")
+                          : t("{count} dishes", { count: (r.exclusions.recipe_ids ?? []).length })}
+                      </strong>
+                    ),
+                  })}
+                </>
+              )}
+            </p>
+            {Object.keys(r.nutrition.rationales).length > 0 && (
+              <ul className="mt-4 space-y-2.5 border-t border-line pt-4">
+                {Object.entries(r.nutrition.rationales).map(([finding, why]) => (
+                  <li key={finding} className="text-sm text-ink-soft">
+                    <strong className="font-semibold text-ink">{conditionName(finding, lang)}.</strong> {why}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </Card>
+        </div>
+
+        {/* the plan the physician is signing */}
+        <div className="min-w-0 space-y-6">
+          <Card
+            title={t("Diet plan")}
+            description={
+              r.nutrition.meal_plan.note
+                ? undefined
+                : [
+                    planIsWeek ? t("Seven days, Saturday to Friday.") : "",
+                    !planTotal
+                      ? t("Target {target} kcal/day", { target: targetKcal })
+                      : planIsWeek
+                        ? t("Target {target} kcal/day, planned {planned} kcal on an average day", {
+                            target: targetKcal,
+                            planned: Math.round(planTotal),
+                          })
+                        : t("Target {target} kcal/day, planned {planned} kcal", {
+                            target: targetKcal,
+                            planned: Math.round(planTotal),
+                          }),
+                  ]
+                    .filter(Boolean)
+                    .join(" ")
+            }
+            action={
+              canEdit && !r.nutrition.meal_plan.note ? (
+                edited ? (
+                  <div className="flex gap-4">
+                    <button className={linkButton + " text-ink-muted!"} onClick={() => setEdited(null)}>
+                      {t("Discard edits")}
+                    </button>
+                    <button className={linkButton} onClick={() => startEdit(r)}>
+                      {t("Edit again")}
+                    </button>
+                  </div>
+                ) : (
+                  <button className={linkButton} onClick={() => startEdit(r)}>
+                    {t("Edit plan")}
+                  </button>
+                )
+              ) : undefined
+            }
+          >
+            {r.nutrition.meal_plan.note ? (
+              <p className="text-sm text-watch-ink">{r.nutrition.meal_plan.note}</p>
+            ) : editing ? (
+              <div className="space-y-4">
+                {draftIsWeek && (
+                  <div className="space-y-2">
+                    <DayPicker
+                      days={draftDays.map((day, i) => ({ day: i + 1, weekday: day.weekday, meals: {} }))}
+                      selected={editDay}
+                      onSelect={setEditDay}
+                      lang={lang}
+                      panelId="plan-editor-day"
+                    />
+                    <p className="font-display text-lg font-bold text-ink">{t("Editing {day}", { day: editDayName ?? "" })}</p>
+                  </div>
+                )}
+                {MEAL_ORDER.filter((m) => draftMeals[m] !== undefined).map((meal) => (
+                  <div key={meal} className="rounded-md border border-line">
+                    <div className="flex items-center justify-between border-b border-line bg-surface-soft px-3 py-2">
+                      <p className="font-semibold text-ink">{mealName(meal, lang)}</p>
+                      <p className="text-sm text-ink-muted">
+                        {t("≈{kcal} kcal", { kcal: draftMeals[meal].reduce((sum, it) => sum + itemKcal(it), 0) })}
+                      </p>
+                    </div>
+                    <ul className="divide-y divide-line">
+                      {draftMeals[meal].map((it, index) => {
+                        const live = foodIndex.get(mealItemKey(it));
+                        const outdated =
+                          foods !== null &&
+                          (!live || (live.name_en !== it.name_en && foodDisplayName(live.name_en) !== it.name_en));
+                        const servings = draftServings(it);
+                        return (
+                          <li
+                            key={`${mealItemKey(it)}-${index}`}
+                            className={`flex items-center gap-2 px-3 py-2 text-sm ${outdated ? "bg-watch-tint" : ""}`}
+                          >
+                            <span className="min-w-0 flex-1">
+                              <span className="block truncate text-ink-strong">
+                                {localName(it, lang)}
+                                {it.name_bn && (
+                                  <span className="text-ink-muted"> {lang === "bn" ? it.name_en : it.name_bn}</span>
+                                )}
+                              </span>
+                              {servings !== undefined && !outdated && (
+                                <span className="block text-xs text-ink-muted">
+                                  {portionText({ recipe_id: it.recipe_id, servings, qty_g: it.qty_g }, lang)}
+                                </span>
+                              )}
+                              {outdated && (
+                                <span className="mt-0.5 flex items-center gap-1 text-xs font-semibold text-watch-ink">
+                                  <IconAlert className="h-3.5 w-3.5" />
+                                  {t("From an older database. Remove it and add its replacement.")}
+                                </span>
+                              )}
+                            </span>
+                            <label className="sr-only" htmlFor={`qty-${meal}-${index}`}>
+                              {t("Grams of {name}", { name: localName(it, lang) })}
+                            </label>
+                            <input
+                              id={`qty-${meal}-${index}`}
+                              type="number"
+                              min={5}
+                              max={2000}
+                              step={5}
+                              value={it.qty_g}
+                              onChange={(e) => setQty(meal, index, Number(e.target.value))}
+                              className="w-20 rounded-md border border-field bg-surface px-2 py-1 text-right text-sm focus:border-clinical focus:outline-none focus:ring-2 focus:ring-clinical/20"
+                            />
+                            <span className="text-xs text-ink-muted">{t("g")}</span>
+                            <span className="w-16 text-right text-xs text-ink-muted">
+                              {it.kcal_per_100g > 0 ? t("{kcal} kcal", { kcal: itemKcal(it) }) : "—"}
+                            </span>
+                            <button
+                              type="button"
+                              aria-label={t("Remove {name}", { name: localName(it, lang) })}
+                              onClick={() => removeItem(meal, index)}
+                              className={removeButton}
+                            >
+                              <IconX className="h-4 w-4" />
+                            </button>
+                          </li>
+                        );
+                      })}
+                      {draftMeals[meal].length === 0 && (
+                        <li className="px-3 py-2 text-sm text-ink-muted">{t("No items. Add one below.")}</li>
+                      )}
+                    </ul>
+                    <div className="border-t border-line px-3 py-2">
+                      <FoodCombobox
+                        foods={foods ?? []}
+                        recommended={recommendedFoods}
+                        onSelect={(food) => addItem(meal, food)}
+                      />
+                    </div>
+                  </div>
+                ))}
+                <div
+                  className={`flex flex-wrap items-center justify-between gap-2 rounded-md border px-4 py-2.5 text-sm font-semibold ${
+                    draftPct >= 85 && draftPct <= 115
+                      ? "border-ok-line bg-ok-tint text-ok-ink"
+                      : draftPct >= 60 && draftPct <= 140
+                        ? "border-watch-line bg-watch-tint text-watch-ink"
+                        : "border-crit-line bg-crit-tint text-crit-ink"
+                  }`}
+                >
+                  <span>
+                    {editDayName
+                      ? t("{day}: planned ≈{planned} kcal of a {target} kcal target", {
+                          day: editDayName,
+                          planned: draftTotalKcal,
+                          target: targetKcal,
+                        })
+                      : t("Planned ≈{planned} kcal of a {target} kcal target", {
+                          planned: draftTotalKcal,
+                          target: targetKcal,
+                        })}
+                  </span>
+                  <span>{n(draftPct)}%</span>
+                </div>
+                {draftIsWeek && (
+                  <p className="text-sm text-ink-soft">
+                    {t("Week average ≈{kcal} kcal a day. Each day is edited on its own; pick a day above.", {
+                      kcal: draftWeekAverage,
+                    })}
+                  </p>
+                )}
+                <p className="text-sm text-ink-muted">
+                  {t("Live estimates from the recipe and food data. Exact totals and nutrient coverage are recomputed when you apply the changes.")}
+                </p>
+              </div>
+            ) : (
+              <>
+                {planPct !== null && (planPct < 85 || planPct > 115) && (
+                  <p className="mb-4 flex items-start gap-2 rounded-md border border-watch-line bg-watch-tint px-4 py-2.5 text-sm text-watch-ink">
+                    <IconAlert className="mt-0.5 h-4 w-4 shrink-0" />
+                    <span>
+                      {rich(
+                        planIsWeek
+                          ? "An average day of this plan totals {total}, {percent}% of the {target} kcal target. Adjust quantities before approving if this is unintended."
+                          : "This plan totals {total}, {percent}% of the {target} kcal target. Adjust quantities before approving if this is unintended.",
+                        {
+                          total: <strong>{t("{kcal} kcal", { kcal: Math.round(planTotal) })}</strong>,
+                          percent: n(planPct),
+                          target: n(planTarget),
+                        }
+                      )}
+                    </span>
+                  </p>
+                )}
+                <WeekPlan days={planDays(r.nutrition.meal_plan)} lang={lang} showItemKcal />
+                <div className="mt-6 space-y-6">
+                  <PlanNutrition
+                    plan={r.nutrition.meal_plan}
+                    limits={r.nutrition.limits}
+                    anthropometrics={r.anthropometrics}
+                    lang={lang}
+                    staff
+                  />
+                </div>
+              </>
+            )}
+          </Card>
+
+          <Card
+            title={t("Exercise plan")}
+            description={
+              !plan.scoring_backend
+                ? t("ACSM FITT-VP prescription")
+                : plan.scoring_backend === "ml"
+                  ? t("ACSM FITT-VP prescription, each group ranked after the safety gate by the trained exercise model")
+                  : t("ACSM FITT-VP prescription, each group ranked after the safety gate by the deterministic formula")
+            }
+          >
+            {plan.note ? (
+              <p className="text-sm text-watch-ink">{plan.note}</p>
+            ) : editing && draftEx ? (
+              <div className="space-y-4">
+                <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
+                  <Field label={t("Aerobic days/week")}>
+                    <input
+                      type="number" min={1} max={7} className={inputClass}
+                      value={draftEx.aerobic_days}
+                      onChange={(e) => setExField("aerobic_days", Number(e.target.value))}
+                    />
+                  </Field>
+                  <Field label={t("Minutes/session")}>
+                    <input
+                      type="number" min={5} max={180} step={5} className={inputClass}
+                      value={draftEx.aerobic_min_per_session}
+                      onChange={(e) => setExField("aerobic_min_per_session", Number(e.target.value))}
+                    />
+                  </Field>
+                  <Field label={t("Strength days/week")}>
+                    <input
+                      type="number" min={0} max={7} className={inputClass}
+                      value={draftEx.strength_days}
+                      onChange={(e) => setExField("strength_days", Number(e.target.value))}
+                    />
+                  </Field>
+                  <Field label={t("Flexibility days/week")}>
+                    <input
+                      type="number" min={0} max={7} className={inputClass}
+                      value={draftEx.flexibility_days}
+                      onChange={(e) => setExField("flexibility_days", Number(e.target.value))}
+                    />
+                  </Field>
+                  {draftEx.balance_days != null && (
+                    <Field label={t("Balance days/week")}>
+                      <input
+                        type="number" min={0} max={7} className={inputClass}
+                        value={draftEx.balance_days}
+                        onChange={(e) => setExField("balance_days", Number(e.target.value))}
+                      />
+                    </Field>
+                  )}
+                </div>
+                <div className="grid divide-y divide-line rounded-md border border-line sm:grid-cols-2 sm:divide-y-0 lg:grid-cols-4">
+                  {(Object.keys(draftEx.type) as ExerciseGroup[]).map((group) => (
+                    <div key={group} className="px-3 py-3 sm:border-l sm:border-line sm:first:border-l-0">
+                      <p className="font-semibold text-ink">{t(GROUP_NAMES[group])}</p>
+                      <ul className="mt-2 space-y-1">
+                        {(draftEx.type[group] ?? []).map((e, index) => (
+                          <li key={e.exercise_id} className="flex items-center justify-between gap-2 text-sm text-ink-strong">
+                            <span className="min-w-0 truncate">{localName(e, lang)}</span>
+                            <button
+                              type="button"
+                              aria-label={t("Remove {name}", { name: localName(e, lang) })}
+                              onClick={() => removeExercise(group, index)}
+                              className={removeButton}
+                            >
+                              <IconX className="h-4 w-4" />
+                            </button>
+                          </li>
+                        ))}
+                        {(draftEx.type[group] ?? []).length === 0 && <li className="text-sm text-ink-muted">{t("None")}</li>}
+                      </ul>
+                    </div>
+                  ))}
+                </div>
+                <p className="text-sm text-ink-muted">
+                  {t("Weekly volume (MET-min and kcal) is recomputed when you apply the changes. Target heart rate stays as the engine prescribed.")}
+                </p>
+              </div>
+            ) : (
+              <div className="space-y-4">
+                <dl className="grid grid-cols-2 gap-x-6 gap-y-3 sm:grid-cols-4">
+                  <div>
+                    <dt className="text-sm text-ink-muted">{t("Aerobic")}</dt>
+                    <dd className="font-semibold text-ink">
+                      {t("{minutes} min/week", { minutes: plan.time!.aerobic_min_per_week })}
+                    </dd>
+                    <dd className="text-sm text-ink-muted">
+                      {t("{days} × {minutes} min", {
+                        days: plan.frequency!.aerobic_days,
+                        minutes: plan.time!.aerobic_min_per_session,
+                      })}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt className="text-sm text-ink-muted">{t("Intensity")}</dt>
+                    <dd className="font-semibold text-ink">{t(INTENSITY_NAMES[plan.intensity!.level] ?? plan.intensity!.level)}</dd>
+                    <dd className="text-sm text-ink-muted">
+                      {t("{low}–{high} bpm", {
+                        low: plan.intensity!.target_hr_bpm[0],
+                        high: plan.intensity!.target_hr_bpm[1],
+                      })}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt className="text-sm text-ink-muted">
+                      {plan.frequency!.balance_days != null
+                        ? t("Strength, flexibility, balance")
+                        : t("Strength, flexibility")}
+                    </dt>
+                    <dd className="font-semibold text-ink">
+                      {t("{times} a week", {
+                        times: [
+                          plan.frequency!.strength_days,
+                          plan.frequency!.flexibility_days,
+                          ...(plan.frequency!.balance_days != null ? [plan.frequency!.balance_days] : []),
+                        ]
+                          .map((days) => `${n(days)}×`)
+                          .join(", "),
+                      })}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt className="text-sm text-ink-muted">{t("Volume")}</dt>
+                    <dd className="font-semibold text-ink">{t("≈{value} MET-min", { value: plan.volume!.met_min_per_week })}</dd>
+                    <dd className="text-sm text-ink-muted">
+                      {t("{kcal} kcal/week, start ×{factor}", {
+                        kcal: plan.volume!.est_kcal_per_week,
+                        factor: plan.volume!.volume_factor,
+                      })}
+                    </dd>
+                  </div>
+                </dl>
+                <div className="divide-y divide-line rounded-md border border-line">
+                  {planGroups(plan.frequency!).map((group) => (
+                    <div key={group} className="grid gap-x-6 gap-y-2 px-3 py-3 sm:grid-cols-[8rem_1fr]">
+                      <p className="font-semibold text-ink">{t(GROUP_NAMES[group])}</p>
+                      <ul className="grid gap-x-6 gap-y-3 sm:grid-cols-2">
+                        {(plan.type?.[group] ?? []).map((ex) => (
+                          <li key={ex.exercise_id}>
+                            <ExerciseItemView ex={ex} lang={lang} staff />
+                            <p className="mt-0.5 text-xs text-ink-muted">
+                              {[
+                                ex.met_value ? t("{value} MET", { value: ex.met_value }) : null,
+                                ex.fitness_level && t(FITNESS_LEVELS[ex.fitness_level] ?? ex.fitness_level),
+                                ex.exercise_id,
+                              ]
+                                .filter(Boolean)
+                                .join(" · ")}
+                            </p>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  ))}
+                </div>
+                {plan.progression && <p className="text-sm text-ink-muted">{plan.progression}</p>}
+              </div>
+            )}
+          </Card>
+
+          {editing && (
+            <div className="rounded-lg border border-clinical bg-clinical-tint p-4">
+              {editError && <div className="mb-3"><ErrorNote message={editError} /></div>}
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <p className="max-w-lg text-sm text-ink-soft">
+                  {t("Applying re-checks every item against this patient's safety exclusions and recomputes all derived numbers on the server.")}
+                </p>
+                <div className="flex gap-2">
+                  <button className={buttonSecondary} onClick={() => setEditing(false)} disabled={applying}>
+                    {t("Cancel")}
+                  </button>
+                  <button className={buttonPrimary} onClick={applyEdits} disabled={applying}>
+                    {applying ? t("Recomputing…") : t("Apply changes")}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          <Card
+            title={t("Recommended foods")}
+            description={[
+              // engine 0.3.0 ranks foods households eat, by what a usual portion supplies
+              engineAtLeast(item.assessment.engine_version, "0.3.0")
+                ? t("Everyday foods ranked by what a usual portion supplies, at most three per food group, after the safety gate.")
+                : t("Ranked per 100 g after the safety gate."),
+              r.nutrition.scoring_backend === "ml" ? t("Trained food model.") : t("Deterministic formula."),
+            ].join(" ")}
+          >
+            {r.nutrition.top_foods.length > 0 ? (
+              <RecommendedFoodsList foods={r.nutrition.top_foods} lang={lang} />
+            ) : (
+              <p className="text-sm text-ink-muted">{t("No foods ranked.")}</p>
+            )}
+          </Card>
+
+          {(r.nutrition.condition_foods ?? []).length > 0 && (
+            <Card
+              title={t("Foods by condition")}
+              description={t("What the patient will see for each condition: foods that are an EU-threshold source of its nutrients (most often eaten first, after the whole safety gate), and the foods and dishes its contraindication rule leaves out.")}
+            >
+              <ConditionFoodsGuide
+                guide={r.nutrition.condition_foods ?? []}
+                rationales={r.nutrition.patient_rationales}
+                lang={lang}
+              />
+            </Card>
+          )}
+
+          <section>
+            <div className="mb-3">
+              <h2 className="font-display text-lg font-bold leading-7 text-ink">{t("Recommended recipes")}</h2>
+              <p className="mt-0.5 text-sm text-ink-muted">
+                {t("Ranked per serving after the safety gate; among suitable dishes the most commonly cooked at home rank first.")}{" "}
+                {engineAtLeast(item.assessment.engine_version, "0.3.0") &&
+                  `${t("Sweets, drinks and dishes over the vitamin A upper limit are left out; you can still add them to the plan.")} `}
+                {r.nutrition.recipe_scoring_backend === "ml" ? t("Trained recipe model.") : t("Deterministic formula.")}
+              </p>
+            </div>
+            {(r.nutrition.top_recipes ?? []).length > 0 ? (
+              <RecommendedRecipesList recipes={r.nutrition.top_recipes} lang={lang} showNotes />
+            ) : (
+              <p className="text-sm text-ink-muted">{t("No recipes ranked.")}</p>
+            )}
+          </section>
+        </div>
+      </div>
+
+      {!decided && (
+        <div
+          ref={wordingPanel}
+          tabIndex={-1}
+          role="region"
+          aria-label={t("The patient's report")}
+          className="scroll-mt-4 rounded-xl focus:outline-none"
+        >
+          <Card
+            title={t("The patient's report")}
+            description={t(
+              "What {name} will read once you approve, in English or Bangla. You read it first: the patient is shown exactly this text.",
+              { name: item.patient.name }
+            )}
+            action={
+              wording && !wordingBusy ? (
+                <div
+                  role="radiogroup"
+                  aria-label={t("Report language")}
+                  className="inline-flex rounded-lg border border-line-strong bg-surface p-0.5"
+                >
+                  {(["en", "bn"] as const).map((l) => (
+                    <button
+                      key={l}
+                      type="button"
+                      role="radio"
+                      aria-checked={shownLang === l}
+                      lang={l}
+                      onClick={() => setWordingLang(l)}
+                      className={`min-h-8 cursor-pointer rounded-md px-3 text-sm font-semibold transition-colors duration-150 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-clinical ${
+                        shownLang === l ? "bg-clinical text-on-clinical" : "text-ink-soft hover:bg-surface-soft"
+                      }`}
+                    >
+                      {l === "en" ? "English" : "বাংলা"}
+                    </button>
+                  ))}
+                </div>
+              ) : undefined
+            }
+          >
+            {wordingBusy ? (
+              <div role="status" className="space-y-3">
+                <p className="text-sm text-ink-soft">
+                  {t("Writing the report in English and Bangla…")}
+                  {useAi && aiAvailable && ` ${t("With AI wording this can take a minute or two.")}`}
+                </p>
+                <Skeleton className="h-4 w-1/3" />
+                <Skeleton className="h-4 w-11/12" />
+                <Skeleton className="h-4 w-4/5" />
+                <Skeleton className="h-4 w-2/3" />
+              </div>
+            ) : !wording || !shownText ? (
+              <div className="space-y-2 text-sm text-ink-soft">
+                <p>
+                  {t("Not written yet. When the plan and your comment are as you want them, preview the report: it is written from them and shown here for you to read.")}
+                </p>
+                {aiAvailable && (
+                  <p className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                    <span>{useAi ? t("It will be worded by AI.") : t("It will be in the standard wording (no AI).")}</span>
+                    <button type="button" className={linkButton} onClick={() => setUseAi(!useAi)}>
+                      {useAi ? t("Use the standard wording instead") : t("Use AI wording instead")}
+                    </button>
+                  </p>
+                )}
+              </div>
+            ) : (
+              <div className="space-y-4">
+                {/* who worded it comes before the text: it is how to read it */}
+                <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+                  <p className="flex items-center gap-1.5 text-sm text-ink-soft">
+                    {shownText.source === "llm" && <IconSparkles className="h-4 w-4 shrink-0 text-clinical" />}
+                    {shownText.source === "llm"
+                      ? t("Worded by AI from this plan. Check it against the plan: your approval covers this wording.")
+                      : t("Standard wording, written from this plan by fixed rules (no AI).")}
+                  </p>
+                  {aiAvailable && (
+                    <button
+                      type="button"
+                      className={linkButton}
+                      disabled={editing}
+                      onClick={() => previewReport(!useAi || aiFellBack)}
+                    >
+                      {!useAi
+                        ? t("Use AI wording instead")
+                        : aiFellBack
+                          ? t("Try the AI wording again")
+                          : t("Use the standard wording instead")}
+                    </button>
+                  )}
+                </div>
+                {shownText.fallback && (
+                  <InfoNote>{t(WORDING_FALLBACKS[shownText.fallback] ?? WORDING_FALLBACKS.unavailable)}</InfoNote>
+                )}
+                {/* both languages are released: say so when the one not on
+                    screen is not in the wording this one is */}
+                {!shownText.fallback && otherText?.fallback && (
+                  <InfoNote>
+                    {t("The {language} report is in the standard wording: its AI wording could not be written. Read it as well.", {
+                      language: shownLang === "en" ? "বাংলা" : "English",
+                    })}
+                  </InfoNote>
+                )}
+                {!wordingCurrent && (
+                  <InfoNote>
+                    {t("The plan or your comment changed after this was written. Preview the report again before approving.")}
+                  </InfoNote>
+                )}
+                <div
+                  lang={shownLang}
+                  className={`rounded-md border border-line bg-surface-soft px-5 py-5 ${wordingCurrent ? "" : "opacity-60"}`}
+                >
+                  <article className="max-w-prose">
+                    <ReportProse text={shownText.text} />
+                  </article>
+                </div>
+              </div>
+            )}
+          </Card>
+        </div>
+      )}
+
+      {decided ? (
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-line bg-surface px-5 py-4">
+          <p className="flex items-center gap-2 text-ink-soft">
+            {rich("This assessment was {status}", {
+              status: (
+                <Badge kind={item.assessment.status}>
+                  {t(STATUS_NAMES[item.assessment.status] ?? item.assessment.status)}
+                </Badge>
+              ),
+            })}
+          </p>
+          {item.assessment.status === "approved" && (
+            <Link href={`/doctor/reports/${item.visit.id}`} className={buttonSecondary}>
+              {t("View report")}
+            </Link>
+          )}
+        </div>
+      ) : (
+        /* The decision stays in reach however far down the plan the physician has read. */
+        <div className="sticky bottom-[calc(4.25rem+env(safe-area-inset-bottom))] z-10 md:bottom-4">
+          <div className="rounded-lg border border-line-strong bg-surface px-4 py-4 shadow-[0_12px_32px_-12px_rgb(27_36_51/0.35)] sm:px-5">
+            {error && <div className="mb-3"><ErrorNote message={error} /></div>}
+            {edited && (
+              <p className="mb-3 flex items-start gap-2 text-sm text-watch-ink">
+                <IconAlert className="mt-0.5 h-4 w-4 shrink-0" />
+                {t("You are approving the edited plan. Your changes go on the audit trail and into the patient's report.")}
+              </p>
+            )}
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-end">
+              <div className="flex min-w-0 flex-1 flex-col gap-3 sm:flex-row sm:items-end">
+                <p className="flex shrink-0 items-center gap-1.5 text-sm text-ink-muted sm:block">
+                  <span className="sm:block sm:text-xs">{t("Signing as")}</span>
+                  <span className="flex items-center gap-1.5 font-semibold text-ink sm:text-base">
+                    <IconRx className="h-4 w-4 text-clinical" strokeWidth={2.2} />
+                    {session?.user.name}
+                  </span>
+                </p>
+                <label className="block min-w-0 flex-1">
+                  <span className="sr-only">{t("Comment for the patient (optional)")}</span>
+                  <input
+                    className={`${inputClass} mt-0!`}
+                    value={comment}
+                    onChange={(e) => setComment(e.target.value)}
+                    placeholder={t("Comment for the patient (optional), e.g. re-check haemoglobin in 4 weeks")}
+                  />
+                </label>
+              </div>
+              <div className="flex gap-2">
+                <button
+                  className={`${buttonDanger} shrink-0 px-3 sm:px-4`}
+                  disabled={submitting || editing || wordingBusy}
+                  onClick={() => decide("rejected")}
+                >
+                  <IconX className="h-4 w-4" />
+                  {t("Reject")}
+                </button>
+                {wordingCurrent ? (
+                  <button
+                    className={`${buttonPrimary} flex-1 whitespace-nowrap lg:flex-none`}
+                    disabled={submitting || editing || wordingBusy}
+                    onClick={() => decide("approved")}
+                  >
+                    <IconCheck className="h-4 w-4" />
+                    {t("Approve and release")}
+                  </button>
+                ) : (
+                  <button
+                    className={`${buttonPrimary} flex-1 whitespace-nowrap lg:flex-none`}
+                    disabled={submitting || editing || wordingBusy}
+                    onClick={() => previewReport(useAi)}
+                  >
+                    <IconFileText className="h-4 w-4" />
+                    {wordingBusy ? t("Writing the report…") : t("Preview the report")}
+                  </button>
+                )}
+              </div>
+            </div>
+            {editing ? (
+              <p className="mt-2 text-sm text-ink-muted">{t("Apply or cancel your plan edits before recording a decision.")}</p>
+            ) : (
+              !wordingCurrent && (
+                <p className="mt-2 text-sm text-ink-muted">
+                  {t("Preview the patient's report first: you approve what you have read.")}
+                </p>
+              )
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

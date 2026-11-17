@@ -1,0 +1,192 @@
+"""ORM models: User, Patient, Visit, Assessment, Approval, AuditLog.
+
+AuditLog rows are append-only: mapper-level guards below reject any UPDATE or
+DELETE issued through the ORM, so the audit trail cannot be rewritten by
+application code.
+"""
+
+from datetime import date, datetime, timezone
+
+from sqlalchemy import JSON, Date, DateTime, ForeignKey, String, UniqueConstraint, event
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class User(Base):
+    """Login account. Doctors register as ``pending`` and can only sign in
+    after an admin approves them; patient accounts link to a Patient row."""
+
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String(255))
+    name: Mapped[str] = mapped_column(String(200))
+    role: Mapped[str] = mapped_column(String(20))  # admin | doctor | patient
+    status: Mapped[str] = mapped_column(String(20), default="active")  # active | pending | rejected
+    specialty: Mapped[str] = mapped_column(String(200), default="")
+    license_no: Mapped[str] = mapped_column(String(100), default="")
+    patient_id: Mapped[int | None] = mapped_column(ForeignKey("patients.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    patient: Mapped["Patient | None"] = relationship(foreign_keys=[patient_id])
+
+
+class Patient(Base):
+    __tablename__ = "patients"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    # the doctor whose patient this is; only that doctor (and an admin) can
+    # open the record, see src/api/access.py. None = not yet with a doctor:
+    # a patient who registered themselves, until a doctor takes them on.
+    # use_alter: users.patient_id points back here, so the two tables cannot
+    # both be created with the other's key already in place.
+    doctor_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", use_alter=True, name="fk_patients_doctor_id"), nullable=True, index=True)
+    name: Mapped[str] = mapped_column(String(200))
+    sex: Mapped[str] = mapped_column(String(10))  # "male" | "female"
+    birth_year: Mapped[int]
+    height_cm: Mapped[float]
+    pregnant: Mapped[bool] = mapped_column(default=False)
+    # 1-3 while pregnant; None when not pregnant or not recorded
+    pregnancy_trimester: Mapped[int | None] = mapped_column(nullable=True)
+    # physician-recorded condition keys, e.g. ["hypertension", "knee_osteoarthritis"]
+    conditions: Mapped[list] = mapped_column(JSON, default=list)
+    # keys of data/reference/dietary_restrictions.yaml, e.g. ["no_beef"]
+    dietary_restrictions: Mapped[list] = mapped_column(JSON, default=list, server_default="[]")
+    # the foods and dishes this patient does not eat, beyond the restrictions:
+    # [{"id": "F301", "kind": "food", "name_en": ..., "name_bn": ...}], see
+    # src/diet/excluded_foods.py for why each keeps its name
+    excluded_foods: Mapped[list] = mapped_column(JSON, default=list, server_default="[]")
+    fitness_level: Mapped[str] = mapped_column(String(20), default="beginner")
+    # sedentary | light | moderate | active; None = not recorded, and the
+    # energy target says the level was assumed
+    activity_level: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    notes: Mapped[str] = mapped_column(String(2000), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    visits: Mapped[list["Visit"]] = relationship(back_populates="patient", order_by="Visit.id")
+
+
+class Visit(Base):
+    __tablename__ = "visits"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    patient_id: Mapped[int] = mapped_column(ForeignKey("patients.id"))
+    weight_kg: Mapped[float]
+    # physician-confirmed values, e.g. {"fasting_glucose": 110, "systolic_bp": 135, ...}
+    biomarkers: Mapped[dict] = mapped_column(JSON, default=dict)
+    # raw OCR output kept verbatim for audit; never used directly for scoring
+    ocr_raw: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    patient: Mapped[Patient] = relationship(back_populates="visits")
+    assessment: Mapped["Assessment | None"] = relationship(back_populates="visit", uselist=False)
+    doctor_notes: Mapped[list["DoctorNote"]] = relationship(back_populates="visit", order_by="DoctorNote.id")
+
+
+class Assessment(Base):
+    __tablename__ = "assessments"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    visit_id: Mapped[int] = mapped_column(ForeignKey("visits.id"), unique=True)
+    status: Mapped[str] = mapped_column(String(20), default="pending")  # pending | approved | rejected
+    # full deterministic engine output: bmi, risk_flags, conditions, targets, plans
+    result: Mapped[dict] = mapped_column(JSON, default=dict)
+    engine_version: Mapped[str] = mapped_column(String(20), default="0.1.0")
+    # the patient's report as last worded for the reviewing physician to read
+    # (src/api/report_wording.py); None until asked for, and again once decided
+    report_draft: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    visit: Mapped[Visit] = relationship(back_populates="assessment")
+    approval: Mapped["Approval | None"] = relationship(back_populates="assessment", uselist=False)
+
+
+class Approval(Base):
+    __tablename__ = "approvals"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    assessment_id: Mapped[int] = mapped_column(ForeignKey("assessments.id"), unique=True)
+    physician_name: Mapped[str] = mapped_column(String(200))
+    decision: Mapped[str] = mapped_column(String(20))  # approved | rejected
+    # if the physician edited the engine output, the edited version they approved
+    edited_result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # the report's wording the physician was shown and approved, per language:
+    # {"en": {"text": ..., "source": "llm" | "template"}, "bn": {...}}. The
+    # report route serves this text and nothing else. None on a rejection, and
+    # on an approval made before the wording was kept (standard wording then).
+    report_text: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    comment: Mapped[str] = mapped_column(String(2000), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    assessment: Mapped[Assessment] = relationship(back_populates="approval")
+
+
+class DoctorNote(Base):
+    """A physician's free-text note/recommendation on a visit, shown in the
+    patient's report. Distinct from Approval.comment (a single remark tied to
+    the approve/reject decision): notes may be added or edited at any time,
+    including after approval."""
+
+    __tablename__ = "doctor_notes"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    visit_id: Mapped[int] = mapped_column(ForeignKey("visits.id"))
+    physician_name: Mapped[str] = mapped_column(String(200))
+    note: Mapped[str] = mapped_column(String(4000))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    # set only once the note has been edited after creation
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    visit: Mapped[Visit] = relationship(back_populates="doctor_notes")
+
+
+class DailyTaskLog(Base):
+    """One patient's day in the daily task list: which of that day's tasks
+    (its meals, its exercise groups) they ticked off. Kept as the day was -
+    the task count with it - so a later plan change never rewrites a past
+    day or the streak built on it. A patient's own record, not a clinical
+    decision: nothing in the engine reads it."""
+
+    __tablename__ = "daily_task_logs"
+    __table_args__ = (UniqueConstraint("patient_id", "day"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    patient_id: Mapped[int] = mapped_column(ForeignKey("patients.id"), index=True)
+    day: Mapped[date] = mapped_column(Date)  # the clinic's calendar day
+    # the visit whose approved plan the day's tasks came from
+    visit_id: Mapped[int] = mapped_column(ForeignKey("visits.id"))
+    done: Mapped[list] = mapped_column(JSON, default=list)  # task keys, e.g. "meal:lunch"
+    total: Mapped[int] = mapped_column(default=0)
+    complete: Mapped[bool] = mapped_column(default=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class AuditLog(Base):
+    __tablename__ = "audit_log"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    actor: Mapped[str] = mapped_column(String(200))
+    action: Mapped[str] = mapped_column(String(100))
+    entity: Mapped[str] = mapped_column(String(50))
+    entity_id: Mapped[int | None] = mapped_column(nullable=True)
+    detail: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+@event.listens_for(AuditLog, "before_update")
+def _audit_no_update(mapper, connection, target):
+    raise RuntimeError("AuditLog is append-only: updates are forbidden")
+
+
+@event.listens_for(AuditLog, "before_delete")
+def _audit_no_delete(mapper, connection, target):
+    raise RuntimeError("AuditLog is append-only: deletes are forbidden")
